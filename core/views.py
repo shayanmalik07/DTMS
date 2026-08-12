@@ -1,21 +1,25 @@
 # core/views.py
-from rest_framework import status, permissions, generics
+from rest_framework import status, permissions, generics, serializers
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.shortcuts import get_object_or_404
 from django.core.signing import TimestampSigner, BadSignature, SignatureExpired
-from drf_spectacular.utils import extend_schema, OpenApiParameter
+from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
 
 from .models import User, Shift, ShiftApplication, ShiftLog, LiveLocation, Incident, Report, Message
 from .serializers import (
     UserSerializer, ShiftSerializer, ShiftApplicationSerializer,
-    IncidentSerializer, ReportSerializer, MessageSerializer, LoginSerializer, RegisterOfficerSerializer
+    IncidentSerializer, ReportSerializer, MessageSerializer, LoginSerializer, RegisterOfficerSerializer,
+    DocumentSerializer, InvoiceSerializer, CompanySerializer
 )
-from .permissions import IsSuperAdmin, IsSupervisor, IsOfficer
+from core.permissions import IsSuperAdmin, IsSupervisor, IsOfficer
 from .utils import calculate_haversine_distance
+from django.utils import timezone
+from datetime import timedelta
 from typing import cast
-from .models import User
+from .models import User,Document, Invoice, Company
+import uuid
 
 signer = TimestampSigner()
 
@@ -50,9 +54,15 @@ def login_view(request):
     })
 
 
-@extend_schema(summary="Generate Officer Invite Link", description="Supervisor generates invitation token for officer registration")
+@extend_schema(
+    summary="Generate Officer Invite Link",
+    request=inline_serializer(
+        name='InviteOfficerSerializer',
+        fields={'email': serializers.EmailField()}
+    )
+)
 @api_view(['POST'])
-@permission_classes([IsSupervisor])
+@permission_classes([IsSupervisor | IsSuperAdmin])  # <--- Allows both!
 def generate_invite_link(request):
     token = signer.sign(f"supervisor:{request.user.pk}")
     invite_url = f"https://yourapp.com/register?token={token}"
@@ -111,7 +121,32 @@ def register_officer(request):
 # 2. USER MANAGEMENT MODULE (4 APIs)
 # ==========================================
 
-@extend_schema(summary="Create Supervisor", description="Super Admin creates a new supervisor account")
+@extend_schema(
+    summary="Create Supervisor",
+    description="Create a new supervisor user account.",
+    request=inline_serializer(
+        name='CreateSupervisorSerializer',
+        fields={
+            'username': serializers.CharField(),
+            'email': serializers.EmailField(),
+            'password': serializers.CharField(write_only=True),
+            'first_name': serializers.CharField(required=False),
+            'last_name': serializers.CharField(required=False),
+        }
+    ),
+    responses={
+        201: inline_serializer(
+            name='CreateSupervisorSuccess',
+            fields={
+                'id': serializers.IntegerField(),
+                'username': serializers.CharField(),
+                'email': serializers.EmailField(),
+                'message': serializers.CharField()
+            }
+        ),
+        400: inline_serializer('SupervisorErrorResponse', fields={'error': serializers.CharField()})
+    }
+)
 @api_view(['POST'])
 @permission_classes([IsSuperAdmin])
 def create_supervisor(request):
@@ -150,7 +185,16 @@ class SupervisorOfficerListView(generics.ListAPIView):
         return User.objects.filter(supervisor=self.request.user, role=User.Role.OFFICER)
 
 
-@extend_schema(summary="Approve/Reject Officer Registration", description="Supervisor decides officer pending registration")
+@extend_schema(
+    summary="Approve or Reject Officer Registration",
+    description="Supervisor approves or rejects an officer's pending registration.",
+    request=inline_serializer(
+        name='OfficerDecisionRequest',
+        fields={
+            'action': serializers.ChoiceField(choices=['approve', 'reject'], help_text="Action to take: 'approve' or 'reject'")
+        }
+    )
+)
 @api_view(['POST'])
 @permission_classes([IsSupervisor])
 def decide_officer_registration(request, officer_id):
@@ -171,7 +215,12 @@ def decide_officer_registration(request, officer_id):
 # ==========================================
 # 3. SHIFT & GEO-FENCING MODULE (5 APIs)
 # ==========================================
-
+@extend_schema(
+    summary="Create a new shift",
+    description="Supervisor or Super Admin creates a new duty shift.",
+    request=ShiftSerializer,
+    responses={201: ShiftSerializer}
+)
 class ShiftListCreateView(generics.ListCreateAPIView):
     """GET/POST /api/shifts - Create shifts (Supervisor) or view available shifts"""
     serializer_class = ShiftSerializer
@@ -207,7 +256,19 @@ def apply_shift(request, shift_id):
     return Response(ShiftApplicationSerializer(app).data, status=status.HTTP_201_CREATED)
 
 
-@extend_schema(summary="Accept/Reject Shift Application", description="Supervisor decides an officer shift application")
+@extend_schema(
+    summary="Approve or Reject Shift Application",
+    description="Supervisor approves or rejects an officer's shift application.",
+    request=inline_serializer(
+        name='ShiftApplicationDecisionRequest',
+        fields={
+            'status': serializers.ChoiceField(
+                choices=['APPROVED', 'REJECTED'],  # or ['approve', 'reject'] based on your view logic
+                help_text="Decision status: 'APPROVED' or 'REJECTED'"
+            )
+        }
+    )
+)
 @api_view(['POST'])
 @permission_classes([IsSupervisor])
 def decide_shift_application(request, application_id):
@@ -222,51 +283,184 @@ def decide_shift_application(request, application_id):
     return Response({'message': f'Shift application updated to {decision}'})
 
 
-@extend_schema(summary="Shift Check-in", description="Officer check-in with 100m radius geo-fencing check")
+# Define the location schema reusable across check-in and check-out
+LocationSerializer = inline_serializer(
+    name='LocationCoordinatesRequest',
+    fields={
+        'latitude': serializers.FloatField(help_text="Current GPS latitude coordinate"),
+        'longitude': serializers.FloatField(help_text="Current GPS longitude coordinate"),
+    }
+)
+
+
+@extend_schema(
+    summary="Officer Shift Check-In",
+    description="Check in to an assigned shift using GPS location (must be within shift radius).",
+    request=LocationSerializer,
+    responses={
+        200: inline_serializer(
+            name='CheckInSuccessResponse',
+            fields={
+                'message': serializers.CharField(),
+                'distance_meters': serializers.FloatField()
+            }
+        ),
+        400: inline_serializer(
+            name='CheckInErrorResponse',
+            fields={'error': serializers.CharField()}
+        )
+    }
+)
 @api_view(['POST'])
 @permission_classes([IsOfficer])
 def checkin_shift(request, shift_id):
     shift = get_object_or_404(Shift, pk=shift_id)
-    officer_lat = float(request.data.get('latitude'))
-    officer_lng = float(request.data.get('longitude'))
+
+    # -------------------------------------------------------------------
+    # 🔴 PREVENT DOUBLE CHECK-IN: Check the officer's latest shift log
+    # -------------------------------------------------------------------
+    latest_log = ShiftLog.objects.filter(
+        shift=shift, 
+        officer=request.user
+    ).order_by('-created_at').first()
+
+    if latest_log and latest_log.type == ShiftLog.Type.CHECKIN:
+        return Response(
+            {'error': 'You are already checked in to this shift. Please check out first.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    lat = request.data.get('latitude')
+    lng = request.data.get('longitude')
+
+    if lat is None or lng is None:
+        return Response({'error': 'Both latitude and longitude are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        officer_lat = float(lat)
+        officer_lng = float(lng)
+    except ValueError:
+        return Response({'error': 'Latitude and longitude must be valid numbers.'}, status=status.HTTP_400_BAD_REQUEST)
 
     distance = calculate_haversine_distance(officer_lat, officer_lng, shift.latitude, shift.longitude)
 
-    if distance > shift.radius_meters:
-        return Response({'error': f'You are outside the shift location. Distance: {round(distance, 2)}m'}, status=status.HTTP_400_BAD_REQUEST)
+    # Use 5.0 meters strictly, or shift.radius_meters if explicitly set smaller
+    allowed_radius = min(getattr(shift, 'radius_meters', 5.0) or 5.0, 5.0)
+
+    if distance > allowed_radius:
+        return Response({
+            'error': f'You are outside the shift location. Distance: {round(distance, 2)}m (Max allowed: {allowed_radius}m)'
+        }, status=status.HTTP_400_BAD_REQUEST)
 
     ShiftLog.objects.create(
-        shift=shift, officer=request.user,
-        type=ShiftLog.Type.CHECKIN, latitude=officer_lat, longitude=officer_lng, within_boundary=True
+        shift=shift, 
+        officer=request.user,
+        type=ShiftLog.Type.CHECKIN, 
+        latitude=officer_lat, 
+        longitude=officer_lng, 
+        within_boundary=True
     )
     return Response({'message': 'Check-in successful', 'distance_meters': round(distance, 2)})
 
 
-@extend_schema(summary="Shift Check-out", description="Officer check-out with 100m radius geo-fencing check")
+@extend_schema(
+    summary="Officer Shift Check-Out",
+    description="Check out of an active shift using GPS location (must be within shift radius).",
+    request=LocationSerializer,
+    responses={
+        200: inline_serializer(
+            name='CheckOutSuccessResponse',
+            fields={
+                'message': serializers.CharField(),
+                'distance_meters': serializers.FloatField()
+            }
+        ),
+        400: inline_serializer(
+            name='CheckOutErrorResponse',
+            fields={'error': serializers.CharField()}
+        )
+    }
+)
 @api_view(['POST'])
 @permission_classes([IsOfficer])
 def checkout_shift(request, shift_id):
     shift = get_object_or_404(Shift, pk=shift_id)
-    officer_lat = float(request.data.get('latitude'))
-    officer_lng = float(request.data.get('longitude'))
 
+    has_checked_in = ShiftLog.objects.filter(
+        shift=shift, 
+        officer=request.user, 
+        type=ShiftLog.Type.CHECKIN
+    ).exists()
+
+    if not has_checked_in:
+        return Response(
+            {'error': 'You cannot check out without checking in first.'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    lat = request.data.get('latitude')
+    lng = request.data.get('longitude')
+
+    # 1. Validate that coordinates were provided
+    if lat is None or lng is None:
+        return Response(
+            {'error': 'Both latitude and longitude are required.'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # 2. Convert coordinates to float safely
+    try:
+        officer_lat = float(lat)
+        officer_lng = float(lng)
+    except ValueError:
+        return Response(
+            {'error': 'Latitude and longitude must be valid numbers.'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # 3. Calculate Haversine distance in meters
     distance = calculate_haversine_distance(officer_lat, officer_lng, shift.latitude, shift.longitude)
 
-    if distance > shift.radius_meters:
-        return Response({'error': f'You are outside the shift location. Distance: {round(distance, 2)}m'}, status=status.HTTP_400_BAD_REQUEST)
+    # 4. Enforce strict 5.0 meter geofence boundary cap
+    allowed_radius = min(getattr(shift, 'radius_meters', 5.0) or 5.0, 5.0)
 
+    if distance > allowed_radius:
+        return Response(
+            {'error': f'You are outside the shift location. Distance: {round(distance, 2)}m (Max allowed: {allowed_radius}m)'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # 5. Log the Check-Out event
     ShiftLog.objects.create(
-        shift=shift, officer=request.user,
-        type=ShiftLog.Type.CHECKOUT, latitude=officer_lat, longitude=officer_lng, within_boundary=True
+        shift=shift,
+        officer=request.user,
+        type=ShiftLog.Type.CHECKOUT,
+        latitude=officer_lat,
+        longitude=officer_lng,
+        within_boundary=True
     )
-    return Response({'message': 'Check-out successful', 'distance_meters': round(distance, 2)})
+
+    return Response({
+        'message': 'Check-out successful',
+        'distance_meters': round(distance, 2)
+    }, status=status.HTTP_200_OK)
 
 
 # ==========================================
 # 4. COMMUNICATION & INCIDENTS MODULE (4 APIs)
 # ==========================================
 
-@extend_schema(summary="Send Direct Message", description="Send 1-on-1 message between officer and supervisor")
+@extend_schema(
+    summary="Send Direct Message",
+    request=inline_serializer(
+        name='DirectMessageSerializer',
+        fields={
+            'recipient': serializers.IntegerField(help_text="User ID of the receiver"),
+            'content': serializers.CharField(help_text="Message body text")
+        }
+    ),
+    responses={201: inline_serializer('DirectMessageSuccess', fields={'message': serializers.CharField()})}
+)
 @api_view(['POST'])
 @permission_classes([permissions.IsAuthenticated])
 def send_message(request):
@@ -288,7 +482,18 @@ def send_message(request):
     return Response(MessageSerializer(msg).data, status=status.HTTP_201_CREATED)
 
 
-@extend_schema(summary="Broadcast Message", description="Supervisor sends broadcast message to all assigned officers")
+@extend_schema(
+    summary="Broadcast Message",
+    request=inline_serializer(
+        name='BroadcastMessageSerializer',
+        fields={
+            'title': serializers.CharField(required=False, default="Notice"),
+            'content': serializers.CharField(help_text="Message to broadcast to all officers"),
+            'target_role': serializers.CharField(required=False, help_text="e.g. OFFICER or ALL")
+        }
+    ),
+    responses={201: inline_serializer('BroadcastSuccess', fields={'message': serializers.CharField()})}
+)
 @api_view(['POST'])
 @permission_classes([IsSupervisor])
 def broadcast_message(request):
@@ -341,7 +546,17 @@ class ReportListCreateView(generics.ListCreateAPIView):
 # 5. TRACKING MODULE (2 APIs)
 # ==========================================
 
-@extend_schema(summary="Update Live Location", description="Officer sends live GPS coordinates during shift")
+@extend_schema(
+    summary="Update Live Location",
+    request=inline_serializer(
+        name='LocationUpdateSerializer',
+        fields={
+            'latitude': serializers.FloatField(),
+            'longitude': serializers.FloatField(),
+        }
+    ),
+    responses={200: inline_serializer('LocationUpdateSuccess', fields={'message': serializers.CharField()})}
+)
 @api_view(['POST'])
 @permission_classes([IsOfficer])
 def update_location(request):
@@ -368,3 +583,77 @@ def get_officer_location(request, officer_id):
         'longitude': location.longitude,
         'updated_at': location.updated_at
     })
+
+# --- DOCUMENT COMPLIANCE & EXPIRY VIEWS ---
+
+class DocumentListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/documents - Upload document or view officer documents"""
+    serializer_class = DocumentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = cast(User, self.request.user)
+        if user.role == User.Role.SUPER_ADMIN:
+            return Document.objects.all()
+        elif user.role == User.Role.SUPERVISOR:
+            return Document.objects.filter(officer__supervisor=user)
+        return Document.objects.filter(officer=user)
+
+    def perform_create(self, serializer):
+        user = cast(User, self.request.user)
+        
+        # Check if request.data is a dict before calling .get()
+        signature = None
+        if isinstance(self.request.data, dict):
+            signature = self.request.data.get('digital_signature')
+
+        serializer.save(
+            officer=user,
+            digital_signature=signature,
+            signed_at=timezone.now() if signature else None
+        )
+
+
+@extend_schema(summary="Expiring Documents Alert", description="Get list of documents expiring within 30 days")
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def expiring_documents(request):
+    user = cast(User, request.user)
+    threshold = timezone.now().date() + timedelta(days=30)
+    
+    if user.role == User.Role.SUPERVISOR:
+        docs = Document.objects.filter(officer__supervisor=user, expiry_date__lte=threshold)
+    else:
+        docs = Document.objects.filter(officer=user, expiry_date__lte=threshold)
+
+    return Response(DocumentSerializer(docs, many=True).data)
+
+
+# --- INVOICING VIEWS ---
+
+class InvoiceListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/invoices - Generate or view staff invoices"""
+    serializer_class = InvoiceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = cast(User, self.request.user)
+        if user.role == User.Role.SUPER_ADMIN:
+            return Invoice.objects.all()
+        elif user.role == User.Role.SUPERVISOR:
+            return Invoice.objects.filter(officer__supervisor=user)
+        return Invoice.objects.filter(officer=user)
+
+    def perform_create(self, serializer):
+        user = cast(User, self.request.user)
+        hours = serializer.validated_data.get('hours_worked', 0)
+        rate = serializer.validated_data.get('hourly_rate', 0)
+        total = hours * rate
+        inv_num = f"INV-{uuid.uuid4().hex[:8].upper()}"
+
+        serializer.save(
+            officer=user,
+            company=user.company,
+            total_amount=total,
+            invoice_number=inv_num
+        )
